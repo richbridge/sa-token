@@ -401,6 +401,45 @@ $refreshToken = StpUtil::getRefreshTokenByAccessToken($accessToken);
 - 刷新时检查账号封禁状态
 - 登出自动清除关联的 RefreshToken
 
+### 12.1 实际应用中的常见问题
+
+以下配置在示例里可以直接运行，但在生产环境通常需要按部署形态重新评估：
+
+| 场景 | 默认/常见写法 | 实际风险 | 建议 |
+|------|---------------|----------|------|
+| 前后端分离、跨子域登录 | `cookieSameSite='Strict'` | 浏览器不会在跨站跳转、第三方回调、部分 iframe 场景携带 Cookie，表现为“明明登录了却丢会话” | 同站应用优先保留 `Strict`；跨站场景改为 `None`，同时开启 `cookieSecure=true`，并明确 `cookieDomain` |
+| 多实例部署 | 内存 DAO / 单机配置直接上线 | 踢人下线、黑名单、RefreshToken、SSO、登录态同步会在不同节点之间失效 | 至少使用 Redis 或共享缓存；多节点场景不要依赖默认内存存储 |
+| 移动网络、代理网络、企业出口 | 开启 `tokenFingerprint=true` | IP 频繁变化、代理层统一出口、UA 被网关改写时会误判盗用，导致用户被频繁踢下线 | 只在高风险后台启用，或改为基于稳定设备标识/代理透传 IP 的策略 |
+| RefreshToken 落地 | 刷新令牌直接暴露给前端脚本 | 一旦前端存储或日志泄漏，攻击者可长期续签 AccessToken | 浏览器端优先用 HttpOnly Cookie 承载 RefreshToken；若前端自行持有，必须配合轮换、失效回收和最短必要有效期 |
+| RefreshToken 轮换 | 服务端返回新 RefreshToken，客户端异步更新 | 并发请求或旧令牌覆盖新令牌时会造成“刷新一次后全部失效” | 客户端原子更新 token 对；刷新接口避免并发调用；服务端日志中区分 AccessToken 失效和 Rotation 冲突 |
+| 登录策略 | 沿用 `concurrent=true`、`isShare=true` | 无法满足“新登录挤掉旧登录”或“同设备唯一会话”等业务要求 | 明确产品语义后再组合 `concurrent`、`isShare`、`maxLoginCount`，不要直接沿用示例值 |
+| Token 加密 | 仅开启 `tokenEncrypt=true` | 只能降低 DAO 中内容裸露风险，不能替代 HTTPS、密钥托管、日志脱敏 | 生产环境同时配置 `aesKey`/`sm4Key` 或 `tokenEncryptKey`，并做好密钥轮换与日志审计 |
+| 多机时间差 | 默认 `signTimestampGap=600` | 节点时钟漂移过大时会出现签名偶发失败 | 所有节点做 NTP 校时；按链路延迟调整 `signTimestampGap`，不要单纯无限放大 |
+
+如果你的接入场景是 SSO、跨域前后端分离或多节点部署，建议先从 Cookie 策略、共享存储、RefreshToken 保存方式三项开始排查，而不是直接按快速开始配置上线。
+
+### 12.2 框架接入约束
+
+当前仓库提供的是框架无关核心库，不是 Laravel ServiceProvider / Symfony Bundle 这类原生框架插件。因此在实际接入时，需要明确遵守以下生命周期约束：
+
+1. 请求进入时完成 `SaToken::init(...)`，并立刻调用 `SaTokenContext::setRequest(...)`
+2. 控制器或业务逻辑执行后，将响应对象回写到 `SaTokenContext::setResponse(...)`
+3. 最终返回响应时，优先返回 `SaTokenContext::getResponse()`，因为登录、登出、RefreshToken 续签可能已经改写 Header / Cookie
+4. 请求结束时执行 `SaToken::clearContext()`，避免常驻内存、协程或复用 worker 场景下的上下文串用
+
+如果只注入 request，没有把 response 回写到 `SaTokenContext`，那么 `isWriteCookie`、`isWriteHeader` 和 `satoken-refresh` 响应头都可能失效。
+
+### 12.3 当前验证状态
+
+当前仓库已完成以下验证：
+
+- PHPUnit 全量通过：`739` tests / `1578` assertions / `3` skipped
+- PHPStan 通过：`No errors`
+- PHP-CS-Fixer dry-run 通过：无待修复格式问题
+- 已补真实 Redis 集成测试；在配置 `REDIS_HOST` / `REDIS_PORT` 且安装 `ext-redis` 时会执行真实连通与 TTL 校验
+
+建议在 CI 中至少保留三类检查：基础 PHP 版本矩阵、带 Redis 扩展和 Redis 服务容器的测试任务、`phpstan + cs-check` 质量门禁。
+
 ### 13. 多账号体系
 
 ```php

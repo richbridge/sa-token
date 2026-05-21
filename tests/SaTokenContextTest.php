@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace SaToken\Tests;
 
 use PHPUnit\Framework\TestCase;
+use SaToken\Tests\Fixtures\SymfonyHeaderBagStub;
 use SaToken\Util\SaTokenContext;
 
 class SaTokenContextTest extends TestCase
@@ -181,9 +182,16 @@ class SaTokenContextTest extends TestCase
 
     public function testSetHeaderWhenNoResponse(): void
     {
-        // 不应抛异常
+        $response = $this->createMock(\Psr\Http\Message\ResponseInterface::class);
+        $newResponse = $this->createMock(\Psr\Http\Message\ResponseInterface::class);
+
         SaTokenContext::setHeader('satoken', 'value');
         $this->assertNull(SaTokenContext::getResponse());
+
+        $response->method('withHeader')->with('satoken', 'value')->willReturn($newResponse);
+        SaTokenContext::setResponse($response);
+
+        $this->assertSame($newResponse, SaTokenContext::getResponse());
     }
 
     // ---- Set Cookie on PSR-7 Response ----
@@ -202,8 +210,57 @@ class SaTokenContextTest extends TestCase
 
     public function testSetCookieWhenNoResponse(): void
     {
-        // 不应抛异常
+        $response = $this->createMock(\Psr\Http\Message\ResponseInterface::class);
+        $newResponse = $this->createMock(\Psr\Http\Message\ResponseInterface::class);
+
         SaTokenContext::setCookie('satoken', 'value');
         $this->assertNull(SaTokenContext::getResponse());
+
+        $response->method('withAddedHeader')->with(
+            'Set-Cookie',
+            $this->stringContains('satoken=value')
+        )->willReturn($newResponse);
+        SaTokenContext::setResponse($response);
+
+        $this->assertSame($newResponse, SaTokenContext::getResponse());
+    }
+
+    public function testSetHeaderOnSymfonyStyleResponse(): void
+    {
+        $headers = new SymfonyHeaderBagStub();
+
+        $response = new \stdClass();
+        $response->headers = $headers;
+        SaTokenContext::setResponse($response);
+
+        SaTokenContext::setHeader('satoken', 'Bearer symfony');
+
+        $resolved = SaTokenContext::getResponse();
+        $this->assertSame($response, $resolved);
+        $this->assertSame('Bearer symfony', $headers->values['satoken'] ?? null);
+    }
+
+    public function testSetCookieOnSymfonyStyleResponse(): void
+    {
+        if (!class_exists(\Symfony\Component\HttpFoundation\Cookie::class)) {
+            require_once __DIR__ . '/Fixtures/SymfonyHttpFoundationCookieStub.php';
+        }
+
+        $headers = new SymfonyHeaderBagStub();
+
+        $response = new \stdClass();
+        $response->headers = $headers;
+        SaTokenContext::setResponse($response);
+
+        SaTokenContext::setCookie('satoken', 'symfony-cookie', 3600, '/', 'example.com', true, true, 'None');
+
+        $resolved = SaTokenContext::getResponse();
+        $this->assertSame($response, $resolved);
+        $this->assertCount(1, $headers->cookies);
+
+        $cookie = $headers->cookies[0];
+        $this->assertSame('satoken', $cookie->name ?? null);
+        $this->assertSame('symfony-cookie', $cookie->value ?? null);
+        $this->assertSame('None', $cookie->sameSite ?? null);
     }
 }

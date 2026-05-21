@@ -7,7 +7,7 @@ on:
     branches: [ main, master ]
 
 jobs:
-  test:
+  test-no-redis:
     runs-on: ubuntu-latest
 
     strategy:
@@ -34,6 +34,41 @@ jobs:
       - name: Execute tests
         run: vendor/bin/phpunit
 
+  test-with-redis-extension:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: gmp, openssl, redis
+          coverage: none
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Execute tests with redis extension
+        run: vendor/bin/phpunit
+
   analyse:
     runs-on: ubuntu-latest
 
@@ -46,11 +81,14 @@ jobs:
           php-version: '8.4'
           extensions: gmp, openssl
 
+      - name: Validate composer.json
+        run: composer validate --strict
+
       - name: Install dependencies
         run: composer install --no-interaction --prefer-dist
 
       - name: PHPStan
-        run: vendor/bin/phpstan analyse
+        run: composer analyse
 
       - name: PHP-CS-Fixer
-        run: vendor/bin/php-cs-fixer fix --dry-run --diff
+        run: composer cs-check

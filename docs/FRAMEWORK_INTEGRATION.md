@@ -2,6 +2,9 @@
 
 本指南说明如何将 sa-token 与主流 PHP 框架集成。
 
+> 注意：当前仓库提供的是框架无关核心库，不包含 Laravel ServiceProvider 或 Symfony Bundle。
+> 因此集成方式以手动配置和中间件/监听器接线为主。
+
 ## 目录
 - [ThinkPHP](#thinkphp)
 - [Laravel](#laravel)
@@ -12,6 +15,17 @@
 ## 核心设计
 
 sa-token 通过 `SaTokenContext` 提供跨框架兼容层，支持以下请求/响应方法：
+
+### 请求生命周期要求
+
+无论接入哪个框架，都建议遵守同一条生命周期约束：
+
+1. 请求进入时尽早执行 `SaToken::init(...)`，并将 request 注入 `SaTokenContext::setRequest(...)`
+2. 控制器或业务逻辑执行完成后，将 response 注入 `SaTokenContext::setResponse(...)`
+3. 返回响应前，优先返回 `SaTokenContext::getResponse()`，因为登录、登出、刷新 Token 可能已经改写了 Header / Cookie
+4. 请求结束时调用 `SaToken::clearContext()`，避免常驻内存或协程场景下的上下文泄漏
+
+如果只做了第 1 步，没有把 response 回写到 `SaTokenContext`，那么 `isWriteCookie`、`isWriteHeader`、RefreshToken 响应头等能力都不会生效。
 
 ### 请求方法
 - `getHeader(name)` - PSR-7 标准
@@ -50,7 +64,7 @@ return [
     'tokenName'       => 'satoken',
     'timeout'         => 2592000, // 30天
     'concurrent'      => true,
-    'share'           => true,
+    'isShare'         => true,
     'maxLoginCount'   => -1,
 ];
 ```
@@ -79,12 +93,13 @@ class SaTokenMiddleware
         }
 
         SaTokenContext::setRequest($request);
-
-        $response = $next($request);
-
-        SaTokenContext::setResponse($response);
-
-        return $response;
+        try {
+            $response = $next($request);
+            SaTokenContext::setResponse($response);
+            return SaTokenContext::getResponse() ?? $response;
+        } finally {
+            SaToken::clearContext();
+        }
     }
 }
 ```
@@ -165,11 +180,9 @@ composer require pohoc/sa-token
 
 ### 配置
 
-```bash
-php artisan vendor:publish --tag=sa-token-config
-```
+当前仓库不提供 Laravel `ServiceProvider`，因此不能使用 `vendor:publish` 自动发布配置。
 
-或手动创建 `config/sa_token.php`：
+请手动创建 `config/sa_token.php`：
 
 ```php
 <?php
@@ -177,7 +190,7 @@ return [
     'tokenName'       => 'satoken',
     'timeout'         => 2592000,
     'concurrent'      => true,
-    'share'           => true,
+    'isShare'         => true,
 ];
 ```
 
@@ -205,12 +218,13 @@ class SaTokenMiddleware
         }
 
         SaTokenContext::setRequest($request);
-
-        $response = $next($request);
-
-        SaTokenContext::setResponse($response);
-
-        return $response;
+        try {
+            $response = $next($request);
+            SaTokenContext::setResponse($response);
+            return SaTokenContext::getResponse() ?? $response;
+        } finally {
+            SaToken::clearContext();
+        }
     }
 }
 ```
@@ -285,14 +299,19 @@ composer require pohoc/sa-token
 
 ### 配置
 
-创建 `config/packages/sa_token.yaml`：
+当前仓库不提供 Symfony Bundle，也不会自动读取 `config/packages/*.yaml`。
 
-```yaml
-sa_token:
-    tokenName: satoken
-    timeout: 2592000
-    concurrent: true
-    share: true
+请在项目根目录手动创建 `config/sa_token.php`：
+
+```php
+<?php
+
+return [
+    'tokenName'       => 'satoken',
+    'timeout'         => 2592000,
+    'concurrent'      => true,
+    'isShare'         => true,
+];
 ```
 
 ### 事件监听器
@@ -318,7 +337,7 @@ class SaTokenListener
         }
 
         if (!SaToken::isInitialized()) {
-            SaToken::init();
+            SaToken::init(require dirname(__DIR__, 2) . '/config/sa_token.php');
         }
 
         SaTokenContext::setRequest($event->getRequest());
@@ -331,6 +350,8 @@ class SaTokenListener
         }
 
         SaTokenContext::setResponse($event->getResponse());
+        $event->setResponse(SaTokenContext::getResponse() ?? $event->getResponse());
+        SaToken::clearContext();
     }
 }
 ```
@@ -419,12 +440,14 @@ class SaTokenMiddleware implements MiddlewareInterface
         $coroutineId = (string) Context::get('coroutine.id', 'default');
         SaTokenContext::setContextId($coroutineId);
         SaTokenContext::setRequest($request);
-
-        $response = $handler->handle($request);
-
-        SaTokenContext::setResponse($response);
-
-        return $response;
+        try {
+            $response = $handler->handle($request);
+            SaTokenContext::setResponse($response);
+            $resolved = SaTokenContext::getResponse();
+            return $resolved instanceof ResponseInterface ? $resolved : $response;
+        } finally {
+            SaToken::clearContext();
+        }
     }
 }
 ```
@@ -483,6 +506,7 @@ $server->on('request', function (Request $request, Response $response) {
     // 设置上下文 ID（协程安全）
     $coroutineId = (string) Swoole\Coroutine::getCid();
     SaTokenContext::setContextId($coroutineId);
+    SaTokenContext::setResponse($response);
 
     // 适配 Request
     $wrappedRequest = new class($request) {
@@ -499,40 +523,43 @@ $server->on('request', function (Request $request, Response $response) {
     };
 
     SaTokenContext::setRequest($wrappedRequest);
+    try {
+        $path = $request->server['request_uri'];
 
-    $path = $request->server['request_uri'];
-
-    if ($path === '/auth/login') {
-        $token = StpUtil::login(1001);
-        $response->header('Content-Type', 'application/json');
-        $response->end(json_encode([
-            'code' => 0,
-            'msg' => '登录成功',
-            'token' => $token
-        ]));
-        return;
-    }
-
-    if ($path === '/auth/userInfo') {
-        try {
-            StpUtil::checkLogin();
+        if ($path === '/auth/login') {
+            $token = StpUtil::login(1001);
             $response->header('Content-Type', 'application/json');
             $response->end(json_encode([
                 'code' => 0,
-                'userId' => StpUtil::getLoginId()
+                'msg' => '登录成功',
+                'token' => $token
             ]));
-        } catch (\Exception $e) {
-            $response->status(401);
-            $response->end(json_encode([
-                'code' => 401,
-                'msg' => '未登录'
-            ]));
+            return;
         }
-        return;
-    }
 
-    $response->status(404);
-    $response->end('Not Found');
+        if ($path === '/auth/userInfo') {
+            try {
+                StpUtil::checkLogin();
+                $response->header('Content-Type', 'application/json');
+                $response->end(json_encode([
+                    'code' => 0,
+                    'userId' => StpUtil::getLoginId()
+                ]));
+            } catch (\Exception $e) {
+                $response->status(401);
+                $response->end(json_encode([
+                    'code' => 401,
+                    'msg' => '未登录'
+                ]));
+            }
+            return;
+        }
+
+        $response->status(404);
+        $response->end('Not Found');
+    } finally {
+        SaToken::clearContext();
+    }
 });
 
 $server->start();

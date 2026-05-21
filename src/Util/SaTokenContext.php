@@ -30,6 +30,18 @@ class SaTokenContext
     protected static array $responseMap = [];
 
     /**
+     * 延迟写入的响应头（按上下文隔离）
+     * @var array<string, array<int, array{name: string, value: string}>>
+     */
+    protected static array $pendingHeadersMap = [];
+
+    /**
+     * 延迟写入的 Cookie（按上下文隔离）
+     * @var array<string, array<int, array{name: string, value: string, timeout: int, path: string, domain: string, secure: bool, httpOnly: bool, sameSite: string}>>
+     */
+    protected static array $pendingCookiesMap = [];
+
+    /**
      * Cookie 存储键前缀
      * @var string
      */
@@ -91,7 +103,9 @@ class SaTokenContext
      */
     public static function setResponse(mixed $response): void
     {
-        self::$responseMap[self::getContextId()] = $response;
+        $id = self::getContextId();
+        self::$responseMap[$id] = $response;
+        self::flushPendingResponseMutations($id);
     }
 
     /**
@@ -112,7 +126,12 @@ class SaTokenContext
     public static function clear(): void
     {
         $id = self::getContextId();
-        unset(self::$requestMap[$id], self::$responseMap[$id]);
+        unset(
+            self::$requestMap[$id],
+            self::$responseMap[$id],
+            self::$pendingHeadersMap[$id],
+            self::$pendingCookiesMap[$id]
+        );
     }
 
     protected static array $trustedProxies = [];
@@ -276,20 +295,15 @@ class SaTokenContext
     {
         $response = self::getResponse();
         if ($response === null) {
+            $id = self::getContextId();
+            self::$pendingHeadersMap[$id][] = [
+                'name' => $name,
+                'value' => $value,
+            ];
             return;
         }
 
-        // PSR-7
-        if ($response instanceof \Psr\Http\Message\ResponseInterface) {
-            $newResponse = $response->withHeader($name, $value);
-            self::setResponse($newResponse);
-            return;
-        }
-
-        // 通用方法
-        if (is_object($response) && method_exists($response, 'header')) {
-            $response->header($name, $value);
-        }
+        self::$responseMap[self::getContextId()] = self::applyHeaderToResponse($response, $name, $value);
     }
 
     /**
@@ -317,19 +331,124 @@ class SaTokenContext
     ): void {
         $response = self::getResponse();
         if ($response === null) {
+            $id = self::getContextId();
+            self::$pendingCookiesMap[$id][] = [
+                'name' => $name,
+                'value' => $value,
+                'timeout' => $timeout,
+                'path' => $path,
+                'domain' => $domain,
+                'secure' => $secure,
+                'httpOnly' => $httpOnly,
+                'sameSite' => $sameSite,
+            ];
             return;
         }
 
+        self::$responseMap[self::getContextId()] = self::applyCookieToResponse(
+            $response,
+            $name,
+            $value,
+            $timeout,
+            $path,
+            $domain,
+            $secure,
+            $httpOnly,
+            $sameSite
+        );
+    }
+
+    protected static function flushPendingResponseMutations(string $id): void
+    {
+        $response = self::$responseMap[$id] ?? null;
+        if ($response === null) {
+            return;
+        }
+
+        foreach (self::$pendingHeadersMap[$id] ?? [] as $header) {
+            $response = self::applyHeaderToResponse($response, $header['name'], $header['value']);
+        }
+
+        foreach (self::$pendingCookiesMap[$id] ?? [] as $cookie) {
+            $response = self::applyCookieToResponse(
+                $response,
+                $cookie['name'],
+                $cookie['value'],
+                $cookie['timeout'],
+                $cookie['path'],
+                $cookie['domain'],
+                $cookie['secure'],
+                $cookie['httpOnly'],
+                $cookie['sameSite']
+            );
+        }
+
+        self::$responseMap[$id] = $response;
+        unset(self::$pendingHeadersMap[$id], self::$pendingCookiesMap[$id]);
+    }
+
+    protected static function applyHeaderToResponse(mixed $response, string $name, string $value): mixed
+    {
+        if ($response instanceof \Psr\Http\Message\ResponseInterface) {
+            return $response->withHeader($name, $value);
+        }
+
+        if (is_object($response) && method_exists($response, 'header')) {
+            $response->header($name, $value);
+            return $response;
+        }
+
+        if (is_object($response) && isset($response->headers) && is_object($response->headers) && method_exists($response->headers, 'set')) {
+            $response->headers->set($name, $value);
+        }
+
+        return $response;
+    }
+
+    protected static function applyCookieToResponse(
+        mixed $response,
+        string $name,
+        string $value,
+        int $timeout,
+        string $path,
+        string $domain,
+        bool $secure,
+        bool $httpOnly,
+        string $sameSite
+    ): mixed {
         if ($response instanceof \Psr\Http\Message\ResponseInterface) {
             $cookieStr = self::buildCookieString($name, $value, $timeout, $path, $domain, $secure, $httpOnly, $sameSite);
-            $newResponse = $response->withAddedHeader('Set-Cookie', $cookieStr);
-            self::setResponse($newResponse);
-            return;
+            return $response->withAddedHeader('Set-Cookie', $cookieStr);
         }
 
         if (is_object($response) && method_exists($response, 'cookie')) {
             $response->cookie($name, $value, $timeout > 0 ? time() + $timeout : 0, $path, $domain, $secure, $httpOnly);
+            return $response;
         }
+
+        if (
+            is_object($response)
+            && isset($response->headers)
+            && is_object($response->headers)
+            && method_exists($response->headers, 'setCookie')
+            && class_exists(\Symfony\Component\HttpFoundation\Cookie::class)
+        ) {
+            $expire = $timeout > 0 ? time() + $timeout : 0;
+            $cookie = new \Symfony\Component\HttpFoundation\Cookie(
+                $name,
+                $value,
+                $expire > 0 ? $expire : 0,
+                $path,
+                $domain !== '' ? $domain : null,
+                $secure,
+                $httpOnly,
+                false,
+                $sameSite !== '' ? $sameSite : null
+            );
+            $response->headers->setCookie($cookie);
+        }
+
+        return $response;
     }
 
     /**
